@@ -1,0 +1,319 @@
+// ======== ПОДКЛЮЧЕНИЕ К СЕРВЕРУ ========
+// Определяем URL сервера (для Render и локальной разработки)
+const SERVER_URL = window.location.hostname === 'localhost' 
+    ? 'http://localhost:3000' 
+    : window.location.origin;
+
+const socket = io(SERVER_URL);
+
+// ======== STATE ========
+let state = {
+    user: null,
+    chats: [],
+    currentChatId: null,
+    allUsers: [],
+    bot: new DeepSeekBot(),
+    botChatId: null,
+    pendingFile: null,
+    circleStream: null,
+    circleRecorder: null,
+    circleChunks: [],
+    circleTimer: null,
+    circleSeconds: 0,
+};
+
+// ======== ВХОД ========
+function loginWithPassword() {
+    const name = document.getElementById('loginUsername').value.trim();
+    const password = document.getElementById('loginPassword').value.trim();
+    const errorEl = document.getElementById('loginError');
+    
+    if (!name || !password) {
+        errorEl.textContent = 'Введите имя и пароль';
+        errorEl.classList.remove('hidden');
+        return;
+    }
+    
+    fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: name, password })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.error) {
+            errorEl.textContent = '❌ ' + data.error;
+            errorEl.classList.remove('hidden');
+        } else {
+            errorEl.classList.add('hidden');
+            loginUser(data.user);
+        }
+    })
+    .catch(() => {
+        errorEl.textContent = '❌ Ошибка подключения к серверу';
+        errorEl.classList.remove('hidden');
+    });
+}
+
+// ======== РЕГИСТРАЦИЯ ========
+function registerUser() {
+    const name = document.getElementById('regUsername').value.trim();
+    const email = document.getElementById('regEmail').value.trim();
+    const password = document.getElementById('regPassword').value.trim();
+    const errorEl = document.getElementById('codeError');
+    const successEl = document.getElementById('codeSuccess');
+    
+    if (!name || !email || !password) {
+        errorEl.textContent = 'Заполните все поля';
+        errorEl.classList.remove('hidden');
+        return;
+    }
+    
+    if (name.length < 3) {
+        errorEl.textContent = 'Имя минимум 3 символа';
+        errorEl.classList.remove('hidden');
+        return;
+    }
+    
+    if (password.length < 4) {
+        errorEl.textContent = 'Пароль минимум 4 символа';
+        errorEl.classList.remove('hidden');
+        return;
+    }
+    
+    fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: name, password, email })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.error) {
+            errorEl.textContent = '❌ ' + data.error;
+            errorEl.classList.remove('hidden');
+        } else {
+            errorEl.classList.add('hidden');
+            successEl.textContent = '✅ Регистрация успешна! Войдите в аккаунт.';
+            successEl.classList.remove('hidden');
+            
+            setTimeout(() => {
+                switchToPassword();
+                document.getElementById('loginUsername').value = name;
+                document.getElementById('loginPassword').value = password;
+                successEl.classList.add('hidden');
+            }, 1500);
+        }
+    })
+    .catch(() => {
+        errorEl.textContent = '❌ Ошибка подключения к серверу';
+        errorEl.classList.remove('hidden');
+    });
+}
+
+// ======== ВХОД ПОЛЬЗОВАТЕЛЯ ========
+function loginUser(user) {
+    state.user = { id: user.id, name: user.username };
+    state.bot.setUserName(user.username);
+    
+    socket.emit('user_join', { 
+        username: user.username, 
+        userId: user.id 
+    });
+    
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('mainApp').style.display = 'flex';
+    
+    // Создаём приветственный чат с ботом
+    if (!state.chats.length) {
+        const welcomeChat = {
+            id: 'welcome_' + Date.now(),
+            type: 'chat',
+            name: 'Tlim Bot',
+            avatar: '🤖',
+            avatarColor: '#1f8b4c',
+            messages: [{ 
+                id: '1', 
+                sender: 'bot', 
+                text: '🎉 Добро пожаловать в Tlim!\nНажмите + чтобы создать чат или группу!', 
+                time: Date.now(), 
+                isBot: true 
+            }],
+            isBot: true,
+        };
+        state.chats.push(welcomeChat);
+        state.botChatId = welcomeChat.id;
+    }
+    
+    renderAll();
+    saveState();
+}
+
+// ======== ОТПРАВКА СООБЩЕНИЙ ========
+function sendMessage(text, videoData, isCircle, fileData) {
+    const chat = getChat(state.currentChatId);
+    if (!chat) return;
+    if (!text && !videoData && !fileData) return;
+    
+    const msgData = {
+        chatId: chat.id,
+        text: text || '',
+        file: fileData || null,
+        video: videoData || null,
+        isCircle: isCircle || false,
+    };
+    
+    socket.emit('send_message', msgData);
+    
+    const msg = {
+        id: 'local_' + Date.now(),
+        chatId: chat.id,
+        sender: state.user.id,
+        username: state.user.name,
+        text: text || '',
+        file: fileData || null,
+        video: videoData || null,
+        isCircle: isCircle || false,
+        time: Date.now(),
+        isBot: false,
+        isSystem: false
+    };
+    
+    if (!chat.messages) chat.messages = [];
+    chat.messages.push(msg);
+    renderMessages();
+    renderChatList();
+    saveState();
+    
+    if (chat.isBot && text) {
+        processBotResponse(chat, text);
+    }
+}
+
+// ======== СОКЕТ-СОБЫТИЯ ========
+socket.on('new_message', (msg) => {
+    const chat = getChat(msg.chatId);
+    if (chat) {
+        if (!chat.messages) chat.messages = [];
+        // Проверяем, нет ли уже такого сообщения
+        if (!chat.messages.find(m => m.id === msg.id)) {
+            chat.messages.push(msg);
+            if (state.currentChatId === msg.chatId) {
+                renderMessages();
+            }
+            renderChatList();
+            saveState();
+        }
+    }
+});
+
+socket.on('users_online', (onlineUsers) => {
+    const status = document.getElementById('cvStatus');
+    if (status && state.user) {
+        if (onlineUsers.includes(state.user.name)) {
+            status.textContent = '🟢 онлайн';
+        } else {
+            status.textContent = '⚪ офлайн';
+        }
+    }
+});
+
+socket.on('user_typing', (data) => {
+    const status = document.getElementById('cvStatus');
+    if (state.currentChatId === data.chatId && data.isTyping) {
+        status.textContent = '✍️ ' + data.username + ' печатает...';
+        clearTimeout(status._timeout);
+        status._timeout = setTimeout(() => {
+            status.textContent = 'онлайн';
+        }, 2000);
+    }
+});
+
+// ======== ОСТАЛЬНОЙ КОД ========
+// Всё остальное (renderChatList, renderMessages, createChat, 
+// обработчики событий и т.д.) остаётся без изменений из вашего исходника.
+// Просто убедитесь, что функция createChat использует этот код:
+
+function createChat(type, name, participants, participantNames) {
+    const existing = state.chats.find(c => c.name === name && c.type === type);
+    if (existing) {
+        alert('Чат с таким названием уже существует!');
+        return false;
+    }
+
+    const newChat = {
+        id: generateId(),
+        type: type,
+        name: name,
+        avatar: name.charAt(0).toUpperCase(),
+        avatarColor: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6,'0'),
+        participants: participants || [state.user.id],
+        participantNames: participantNames || [],
+        messages: [],
+        folderId: null,
+        unread: 0,
+        isBot: false,
+        isOwner: true,
+        created: Date.now(),
+    };
+    
+    if (type === 'group') {
+        if (!newChat.participants.includes(state.user.id)) newChat.participants.push(state.user.id);
+        if (!newChat.participantNames.includes(state.user.name)) newChat.participantNames.push(state.user.name);
+        newChat.messages.push({
+            id: generateId(),
+            sender: 'system',
+            text: `👥 Группа "${name}" создана!\nУчастники: ${newChat.participantNames.join(', ')}`,
+            time: Date.now(),
+            isSystem: true
+        });
+    }
+    if (type === 'channel') {
+        newChat.messages.push({
+            id: generateId(),
+            sender: 'system',
+            text: `📢 Канал "${name}" создан!`,
+            time: Date.now(),
+            isSystem: true
+        });
+    }
+    
+    state.chats.push(newChat);
+    state.currentChatId = newChat.id;
+    saveState();
+    renderAll();
+    openChat(newChat.id);
+    return true;
+}
+
+// Загрузка пользователей с сервера
+function loadUsers() {
+    fetch('/api/users')
+        .then(res => res.json())
+        .then(users => {
+            state.allUsers = users;
+            saveState();
+        })
+        .catch(console.error);
+}
+
+// ======== ОБНОВЛЁННЫЙ INIT ========
+document.addEventListener('DOMContentLoaded', () => {
+    loadState();
+    loadUsers();
+    
+    if (state.user) {
+        state.bot.setUserName(state.user.name);
+        state.bot.setAllUsers(state.allUsers);
+        document.getElementById('loginScreen').style.display = 'none';
+        document.getElementById('mainApp').style.display = 'flex';
+        
+        socket.emit('user_join', { 
+            username: state.user.name, 
+            userId: state.user.id 
+        });
+        
+        renderAll();
+    }
+    
+    // ... все остальные обработчики событий остаются как в вашем коде ...
+});
